@@ -80,4 +80,5 @@ dependencies {
     implementation libs.org.eclipse.paho.android.service
     implementation libs.org.eclipse.paho.client.mqttv3
     implementation libs.okhttp
+    implementation libs.datastore.preferences
 }

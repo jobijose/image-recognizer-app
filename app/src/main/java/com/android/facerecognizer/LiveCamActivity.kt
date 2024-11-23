@@ -1,394 +1,261 @@
-package com.android.facerecognizer;
+package com.android.facerecognizer
 
-import android.app.Activity;
-import android.app.AlertDialog;
-import android.content.Context;
-import android.content.DialogInterface;
-import android.content.SharedPreferences;
-import android.graphics.ImageFormat;
-import android.hardware.Camera;
-import android.hardware.Camera.PreviewCallback;
-import android.hardware.Camera.Size;
-import android.os.Bundle;
-import android.util.Log;
-import android.view.LayoutInflater;
-import android.view.Menu;
-import android.view.MenuItem;
-import android.view.SurfaceHolder;
-import android.view.SurfaceView;
-import android.view.View;
-import android.view.Window;
-import android.widget.Button;
-import android.widget.EditText;
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.os.Bundle
+import android.util.Log
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.core.content.ContextCompat
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.preferencesDataStore
+import androidx.lifecycle.lifecycleScope
+import com.android.facerecognizer.databinding.ActivityLiveCamBinding
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.MultipartBody
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import okio.IOException
+import java.io.ByteArrayOutputStream
+import java.time.Instant
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
-import java.io.IOException;
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
-import java.net.InetAddress;
-import java.net.SocketException;
-import java.net.UnknownHostException;
-import java.util.ArrayList;
-import java.util.List;
 
+class LiveCamActivity : AppCompatActivity(), HostAddressDialog.HostAddressDialogListener {
+    private lateinit var viewBinding: ActivityLiveCamBinding
 
-public class LiveCamActivity extends Activity implements SurfaceHolder.Callback, PreviewCallback
-{
-	private final static String TAG = LiveCamActivity.class.getSimpleName();
-	
-	private final static String SP_CAM_WIDTH = "cam_width";
-	private final static String SP_CAM_HEIGHT = "cam_height";
-	private final static String SP_DEST_IP = "dest_ip";
-	private final static String SP_DEST_PORT = "dest_port";
-	
-	private final static int DEFAULT_FRAME_RATE = 15;
-	private final static int DEFAULT_BIT_RATE = 500000;
-	
-	Camera camera;
-	SurfaceHolder previewHolder;	
-	byte[] previewBuffer;
-	boolean isStreaming = false;
-	AvcEncoder encoder;
-	DatagramSocket udpSocket;
-	InetAddress address;
-	int port;
-	ArrayList<byte[]> encDataList = new ArrayList<byte[]>();
-	ArrayList<Integer> encDataLengthList = new ArrayList<Integer>();
-	
-	Runnable senderRun = new Runnable() {
-		@Override
-		public void run()
-		{
-			while (isStreaming)
-			{
-				boolean empty = false;
-				byte[] encData = null;
-				
-				synchronized(encDataList)
-				{
-					if (encDataList.size() == 0)
-					{
-						empty = true;
-					}
-					else
-						encData = encDataList.remove(0);
-				}
-				if (empty)
-				{
-					try {
-						Thread.sleep(10);
-					} catch (InterruptedException e) {
-						e.printStackTrace();
-					}
-					continue;
-				}
-		        try 
-		        {         
-		        	DatagramPacket packet = new DatagramPacket(encData, encData.length, address, port);  
-		            udpSocket.send(packet);  
-		        }
-		        catch (IOException e)  
-		        {  
-		          	e.printStackTrace();
-		        }				
-			}
-			//TODO:
-		}
-	};
-	
-    @Override
-    protected void onCreate(Bundle savedInstanceState) 
-    {
-        super.onCreate(savedInstanceState);
-        this.requestWindowFeature(Window.FEATURE_NO_TITLE);
-        this.setContentView(R.layout.activity_main);
-        
-        this.findViewById(R.id.btnCamSize).setOnClickListener(
-        	new View.OnClickListener() 
-        	{
-				@Override
-				public void onClick(View v) 
-				{
-					showSettingsDlg();
-				}
-			});
-        
-        this.findViewById(R.id.btnStream).setOnClickListener(
-            	new View.OnClickListener() 
-            	{
-    				@Override
-    				public void onClick(View v) 
-    				{
-    					if (isStreaming)
-    					{
-    						((Button)v).setText("Stream");
-    						stopStream();
-    					}
-    					else
-    					{
-    						showStreamDlg();
-    					}
-    				}
-    			});        
-        
-        SurfaceView svCameraPreview = (SurfaceView) this.findViewById(R.id.svCameraPreview);        
-        this.previewHolder = svCameraPreview.getHolder();
-        this.previewHolder.addCallback(this);     
-    }
-    
-    @Override
-    protected void onPause() 
-    {
-    	this.stopStream();
-    	
+    private var imageCapture: ImageCapture? = null
 
-        if (encoder != null)
-        	encoder.close();
-        
-    	super.onPause();
+    private lateinit var cameraExecutor: ExecutorService
+    private lateinit var bitmapBuffer: Bitmap
+
+    private val client = OkHttpClient()
+    private lateinit var hostAddressDialog: HostAddressDialog
+
+    private lateinit var hostAddressValue: String
+    private var cameraFrequencyValue: Int = 5
+    private var epoch = Instant.now().epochSecond
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        viewBinding = ActivityLiveCamBinding.inflate(layoutInflater)
+        viewBinding.root.keepScreenOn = true
+        setContentView(viewBinding.root)
+        hostAddressDialog = HostAddressDialog()
+        fetchHostAddress()
+        // Request camera permissions
+        if (allPermissionsGranted()) {
+            startCamera()
+        } else {
+            requestPermissions()
+        }
+
+        // Set up the listeners for take photo and video capture buttons
+        viewBinding.btnSettings.setOnClickListener { showDialog() }
+
+        cameraExecutor = Executors.newSingleThreadExecutor()
     }
 
-    @Override
-    public boolean onCreateOptionsMenu(Menu menu) 
-    {
-        getMenuInflater().inflate(R.menu.main, menu);
-        return true;
+    private fun showDialog() {
+        val bundle = Bundle()
+        bundle.putString(HOST_ADDRESS, hostAddressValue)
+        bundle.putInt(FREQUENCY_VALUE, cameraFrequencyValue)
+        hostAddressDialog.arguments = bundle
+        hostAddressDialog.show(supportFragmentManager, HOST_ADDRESS)
     }
 
-    @Override
-    public boolean onOptionsItemSelected(MenuItem item) 
-    {
-        int id = item.getItemId();
-        if (id == R.id.action_settings)
-            return true;
-        return super.onOptionsItemSelected(item);
+    private fun startCamera() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+
+
+        cameraProviderFuture.addListener({
+            // Used to bind the lifecycle of cameras to the lifecycle owner
+            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
+
+            // Preview
+            val preview = Preview.Builder()
+                .build()
+                .also {
+                    it.setSurfaceProvider(viewBinding.viewFinder.surfaceProvider)
+                }
+
+            imageCapture = ImageCapture.Builder().build();
+            val imageAnalysis = ImageAnalysis.Builder()
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+
+            imageAnalysis.setAnalyzer(cameraExecutor, ImageAnalysis.Analyzer { image ->
+                if (!::bitmapBuffer.isInitialized) {
+
+                    bitmapBuffer = Bitmap.createBitmap(
+                        image.width, image.height, Bitmap.Config.ARGB_8888)
+                }
+
+                image.use {
+                    bitmapBuffer.copyPixelsFromBuffer(image.planes[0].buffer)
+                    makeHttpCallInScheduledFrequency(bitmapBuffer)
+                }
+                image.close()
+            })
+
+            // Select back camera as a default
+            val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
+
+            try {
+                // Unbind use cases before rebinding
+                cameraProvider.unbindAll()
+
+                // Bind use cases to camera
+                cameraProvider
+                    .bindToLifecycle(this, cameraSelector, preview, imageCapture, imageAnalysis)
+            } catch(exc: Exception) {
+                Log.e(TAG, "Use case binding failed", exc)
+            }
+
+        }, ContextCompat.getMainExecutor(this))
+
     }
 
-	@Override
-	public void onPreviewFrame(byte[] data, Camera camera) 
-	{
-		this.camera.addCallbackBuffer(this.previewBuffer);
-		
-		if (this.isStreaming)
-		{
-			if (this.encDataLengthList.size() > 100)
-			{
-				Log.e(TAG, "OUT OF BUFFER");
-				return;
-			}
-			
-			byte[] encData = this.encoder.offerEncoder(data);
-			if (encData.length > 0)
-			{
-				synchronized(this.encDataList)
-				{
-					this.encDataList.add(encData);
-				}
-			}
-		}
-	}
+    private fun makeHttpCallInScheduledFrequency(bitmap: Bitmap) {
+        val currEpoch = Instant.now().epochSecond
+        if (currEpoch - epoch > cameraFrequencyValue) {
+            makeHttpCall(bitmap)
+            epoch = currEpoch
+        }
+    }
 
-	@Override
-	public void surfaceCreated(SurfaceHolder holder) 
-	{
-		startCamera();
-	}
+    private fun requestPermissions() {
+        activityResultLauncher.launch(REQUIRED_PERMISSIONS)
+    }
 
-	@Override
-	public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) 
-	{
-	}
+    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
+        ContextCompat.checkSelfPermission(
+            baseContext, it) == PackageManager.PERMISSION_GRANTED
+    }
 
-	@Override
-	public void surfaceDestroyed(SurfaceHolder holder)
-	{
-		stopCamera();
-	}
-	
-	private void startStream(String ip, int port)
-	{
-		SharedPreferences sp = this.getPreferences(Context.MODE_PRIVATE);
-        int width = sp.getInt(SP_CAM_WIDTH, 0);
-        int height = sp.getInt(SP_CAM_HEIGHT, 0);        
-        
-        this.encoder = new AvcEncoder();
-        this.encoder.init(width, height, DEFAULT_FRAME_RATE, DEFAULT_BIT_RATE);
-        
-        try
-        {  
-        	this.udpSocket = new DatagramSocket();  
-            this.address = InetAddress.getByName(ip); 
-            this.port = port;
+    override fun onDestroy() {
+        super.onDestroy()
+        cameraExecutor.shutdown()
+    }
+
+    companion object {
+        private const val TAG = "LiveCamActivity"
+        private const val FILENAME_FORMAT = "yyyy-MM-dd-HH-mm-ss-SSS"
+        private val REQUIRED_PERMISSIONS =
+            mutableListOf (
+                Manifest.permission.CAMERA,
+                Manifest.permission.RECORD_AUDIO
+            ).toTypedArray()
+        private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
+        internal const val HOST_ADDRESS = "HOST_ADDRESS"
+        internal const val FREQUENCY_VALUE = "FREQUENCY_VALUE"
+        private val HOST_ADDR_KEY = stringPreferencesKey(HOST_ADDRESS)
+        private val FREQUENCY_KEY = intPreferencesKey(FREQUENCY_VALUE)
+    }
+
+    private val activityResultLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.RequestMultiplePermissions())
+        { permissions ->
+            // Handle Permission granted/rejected
+            var permissionGranted = true
+            permissions.entries.forEach {
+                if (it.key in REQUIRED_PERMISSIONS && !it.value)
+                    permissionGranted = false
+            }
+            if (!permissionGranted) {
+                Toast.makeText(baseContext,
+                    "Permission request denied",
+                    Toast.LENGTH_SHORT).show()
+            } else {
+                startCamera()
+            }
         }
-        catch (SocketException e)
-        {  
-            // TODO Auto-generated catch block  
-        	e.printStackTrace();
-        	return;
+
+    private fun makeHttpCall(bitmap: Bitmap) {
+        val stream = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 100, stream)
+        run(stream.toByteArray())
+    }
+
+    private fun run(byteArray: ByteArray) {
+        val requestBody: RequestBody = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("image", "live_img.jpg",
+                byteArray.toRequestBody("image/*jpg".toMediaTypeOrNull(), 0, byteArray.size))
+            .build()
+        val request = Request.Builder()
+            .url("$hostAddressValue/devices/images")
+            .post(requestBody)
+            .build()
+        Log.d(TAG, "Calling url ${request.url}")
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                e.printStackTrace()
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+
+                    if (!response.isSuccessful) throw IOException("Unexpected code $response")
+
+                    for ((name, value) in response.headers) {
+                        Log.i(TAG,"$name: $value")
+                    }
+
+                    Log.i(TAG, response.body!!.string())
+                }
+            }
+        })
+
+    }
+    private fun fetchHostAddress() {
+        runBlocking {
+            hostAddressValue = dataStore.data
+                .map { preferences ->
+                    preferences[HOST_ADDR_KEY] ?: "http://"
+                }.first()
+            cameraFrequencyValue = dataStore.data
+                .map { preferences ->
+                    preferences[FREQUENCY_KEY] ?: 5
+                }.first()
         }
-        catch (UnknownHostException e) 
-        {  
-            // TODO Auto-generated catch block
-        	e.printStackTrace();
-        	return;
-        }  
-		sp.edit().putString(SP_DEST_IP, ip).commit();
-		sp.edit().putInt(SP_DEST_PORT, port).commit();
-		
-        this.isStreaming = true;
-        Thread thrd = new Thread(senderRun);
-        thrd.start();
-        
-		((Button)this.findViewById(R.id.btnStream)).setText("Stop");		
-		this.findViewById(R.id.btnCamSize).setEnabled(false);
-	}
-	
-	private void stopStream()
-	{
-		this.isStreaming = false;
-		
-		if (this.encoder != null)
-			this.encoder.close();
-		this.encoder = null;
-		
-		this.findViewById(R.id.btnCamSize).setEnabled(true);
-	}
-	
-	private void startCamera()
-	{        
-		SharedPreferences sp = this.getPreferences(Context.MODE_PRIVATE);
-        int width = sp.getInt(SP_CAM_WIDTH, 0);
-        int height = sp.getInt(SP_CAM_HEIGHT, 0);
-        if (width == 0)
-        {
-        	Camera tmpCam = Camera.open();  
-        	Camera.Parameters params = tmpCam.getParameters();  
-    		final List<Size> prevSizes = params.getSupportedPreviewSizes();
-    		int i = prevSizes.size()-1;
-    		width = prevSizes.get(i).width;
-    		height = prevSizes.get(i).height;    		
-    		sp.edit().putInt(SP_CAM_WIDTH, width).commit();
-    		sp.edit().putInt(SP_CAM_HEIGHT, height).commit();
-    		tmpCam.release();
-    		tmpCam = null;
+    }
+
+    override fun onSubmit(hostAddress: String, frequencyValue: Int) {
+        Log.d(TAG, "Host address = $hostAddress; Frequency value = $frequencyValue")
+        if (hostAddress.isNotEmpty()) {
+            lifecycleScope.launch {
+                dataStore.edit { settings ->
+                    settings[HOST_ADDR_KEY] = hostAddress
+                    settings[FREQUENCY_KEY] = frequencyValue
+                }
+                hostAddressValue = hostAddress
+                cameraFrequencyValue = frequencyValue
+            }
         }
-        
-        this.previewHolder.setFixedSize(width, height);
-        
-    	int stride = (int) Math.ceil(width/16.0f) * 16;
-    	int cStride = (int) Math.ceil(width/32.0f)  * 16;
-        final int frameSize = stride * height;
-        final int qFrameSize = cStride * height / 2;
-        
-        this.previewBuffer = new byte[frameSize + qFrameSize * 2];
-        
-        try   
-        {  
-        	camera = Camera.open();  
-        	camera.setPreviewDisplay(this.previewHolder);  
-            Camera.Parameters params = camera.getParameters();  
-            params.setPreviewSize(width, height);  
-            params.setPreviewFormat(ImageFormat.YV12);  
-            camera.setParameters(params);   
-            camera.addCallbackBuffer(previewBuffer);
-            camera.setPreviewCallbackWithBuffer(this);  
-            camera.startPreview();                
-        }
-        catch (IOException e)   
-        {  
-            //TODO:
-        }   
-        catch (RuntimeException e)
-        {
-            //TODO:
-        }        		
-	}
-	
-	private void stopCamera()
-	{
-    	if (camera != null)
-    	{
-			camera.setPreviewCallback(null);
-			camera.stopPreview();   
-	        camera.release();  
-	        camera = null;
-    	}
-	}
-	
-	private void showStreamDlg()
-	{        
-		LayoutInflater inflater = this.getLayoutInflater();
-		View content = inflater.inflate(R.layout.stream_dlg_view, null);
-		
-		SharedPreferences sp = this.getPreferences(Context.MODE_PRIVATE);
-        String ip = sp.getString(SP_DEST_IP, "");
-        int port = sp.getInt(SP_DEST_PORT, -1);
-        if (ip.length() > 0)
-        {
-        	EditText etIP = (EditText)content.findViewById(R.id.etIP);
-        	etIP.setText(ip);
-        	EditText etPort = (EditText)content.findViewById(R.id.etPort);
-        	etPort.setText(String.valueOf(port));
-        }
-		
-		AlertDialog.Builder dlgBld = new AlertDialog.Builder(this);
-		dlgBld.setTitle(R.string.app_name);
-		dlgBld.setView(content);
-		dlgBld.setPositiveButton(android.R.string.ok, 
-			new DialogInterface.OnClickListener() 
-			{
-				@Override
-				public void onClick(DialogInterface dialog, int which)
-				{
-					EditText etIP = (EditText) ((AlertDialog)dialog).findViewById(R.id.etIP);
-					EditText etPort = (EditText) ((AlertDialog)dialog).findViewById(R.id.etPort);
-					String ip = etIP.getText().toString();
-					int port = Integer.valueOf(etPort.getText().toString());
-					if (ip.length() > 0 && (port >=0 && port <= 65535))
-					{
-						startStream(ip, port);
-					}
-					else
-					{
-						//TODO:
-					}					
-				}
-			});
-		dlgBld.setNegativeButton(android.R.string.cancel, null);
-		dlgBld.show();
-	}
-	
-	private void showSettingsDlg()
-	{
-		Camera.Parameters params = camera.getParameters();  
-		final List<Size> prevSizes = params.getSupportedPreviewSizes();
-		String[] choiceStrItems = new String[prevSizes.size()];
-		ArrayList<String> choiceItems = new ArrayList<String>();
-		for (Size s : prevSizes)
-		{
-			choiceItems.add(s.width + "x" + s.height);
-		}
-		choiceItems.toArray(choiceStrItems);
-		
-		AlertDialog.Builder dlgBld = new AlertDialog.Builder(this);
-		dlgBld.setTitle(R.string.app_name);
-		dlgBld.setSingleChoiceItems(choiceStrItems, 0, null);			
-		dlgBld.setPositiveButton(android.R.string.ok, 
-			new DialogInterface.OnClickListener() 
-			{
-				@Override
-				public void onClick(DialogInterface dialog, int which)
-				{
-					int pos = ((AlertDialog)dialog).getListView().getCheckedItemPosition();
-					Size s = prevSizes.get(pos);
-					SharedPreferences sp = LiveCamActivity.this.getPreferences(Context.MODE_PRIVATE);
-					sp.edit().putInt(SP_CAM_WIDTH, s.width).commit();
-					sp.edit().putInt(SP_CAM_HEIGHT, s.height).commit();
-					
-					stopCamera();
-			        startCamera();
-				}
-			});
-		dlgBld.setNegativeButton(android.R.string.cancel, null);
-		dlgBld.show();
-	}
+    }
 }
